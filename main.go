@@ -1,0 +1,124 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"syscall"
+	"time"
+	"webconsole/global"
+
+	"go.uber.org/zap"
+
+	"net/http"
+	"os"
+	"os/signal"
+	"webconsole/internal/dao/database"
+	"webconsole/internal/router"
+	"webconsole/pkg/logger"
+	sf "webconsole/pkg/snowflake"
+	"webconsole/pkg/trans"
+
+	_ "github.com/go-sql-driver/mysql"
+)
+
+func init() {
+	// 加载配置文件
+	if err := global.Init(); err != nil {
+		fmt.Println("init failed, err: ", err)
+		panic(err)
+	}
+
+	err := global.Conf.ReadSection("server", &global.ServerSetting)
+	if err != nil {
+		fmt.Println("init failed, err: ", err)
+		panic(err)
+	}
+
+	// 初始化日志
+	err = global.Conf.ReadSection("log", &global.LoggerSetting)
+	if err != nil {
+		fmt.Println("init logger failed, err: ", err)
+		panic(err)
+	}
+
+	if err := logger.Init(); err != nil {
+		fmt.Println("init logger failed, err: ", err)
+		panic(err)
+	}
+
+	zap.L().Debug("logger init success...")
+
+	// 初始化ID生成器
+	if err := sf.Init(global.ServerSetting.StartTime, global.ServerSetting.MachineID); err != nil {
+		fmt.Println("init logger failed, err: ", err)
+		panic(err)
+	}
+
+	zap.L().Debug("ID init success...")
+
+	// 初始化翻译器设置
+	if err := trans.Init(); err != nil {
+		fmt.Println("init trans failed, err: ", err)
+		panic(err)
+
+	}
+	zap.L().Debug("Trans init success...")
+
+	// 初始化sql设置
+	err = global.Conf.ReadSection("database", &global.DatabaseSetting)
+	if err != nil {
+		fmt.Println("init database failed, err: ", err)
+		panic(err)
+	}
+
+	// 初始化sql连接
+	if err := database.Init(); err != nil {
+		fmt.Println("init database failed, err: ", err)
+		panic(err)
+	}
+
+	zap.L().Debug("database init success...")
+}
+
+// @title 分布式遥感影像云存储后端系统
+// @version 1.0.0
+// @description EOSS-Gateway
+func main() {
+
+	defer zap.L().Sync()
+	r, err := router.NewRouter()
+	if err != nil {
+		return
+	}
+
+	server := &http.Server{
+		Addr:    fmt.Sprintf(":%d", global.ServerSetting.Port),
+		Handler: r,
+	}
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil &&
+			err != http.ErrServerClosed {
+			zap.L().Error("Listen: ", zap.Error(err))
+			panic(err)
+		}
+	}()
+
+	// 优雅关机
+	quit := make(chan os.Signal, 1) // 创建一个接受信号的信道
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit // 阻塞在此处
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// 延时关闭数据库连接(可能有坑)
+	defer global.DB.Close()
+
+	if err := server.Shutdown(ctx); err != nil {
+		zap.L().Error("Shutdown", zap.Error(err))
+	}
+
+	zap.L().Info("Server exit")
+
+}
